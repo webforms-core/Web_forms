@@ -4371,6 +4371,9 @@ async function cb_SetValueToInput(evt, ActionOperation, ActionFeature, ActionVal
             }
             else
             {
+                if (ElementPlace.startsWith('@'))
+                    ElementPlace = await cb_FetchValue(evt, ElementPlace.Replace("$[eq];", '='));
+
                 let tmpElement = cb_GetElementByElementPlace(ElementPlace, null, TransientDOM);
 
                 if (Array.isArray(tmpElement) || tmpElement instanceof NodeList || tmpElement instanceof HTMLCollection)
