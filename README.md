@@ -20,6 +20,10 @@ WebFormsJS is developed by [**Elanat**](https://elanat.net) as part of the WebFo
 * Runtime
 * HTML Automator
 * State Manager
+* Fetch Engine
+* DOM Controller
+* Request Manager
+* Response Processor
 
 ### Advantages
 
