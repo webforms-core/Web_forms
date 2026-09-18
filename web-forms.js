@@ -1,4 +1,4 @@
-/* WebFormsJS 2.1.1 - The Front-End Part of WebForms Core Technology, Owned by Elanat (https://elanat.net) */
+/* WebFormsJS 2.1.2 - The Front-End Part of WebForms Core Technology, Owned by Elanat (https://elanat.net) */
 
 /* Start Options */
 
@@ -4103,8 +4103,7 @@ async function cb_RunWebFormsValues(evt, RequestName, WebFormsValues, UsePostBac
                             continue;
                         case 'R':
                         {
-                            const searchValue = cacheValue.GetTextAfter(GS);
-                            cacheValue = cacheValue.GetTextBefore(GS);
+                            const searchValue = v3;
                             cb_SetStorage(isCache, cacheName, cb_GetStorage(isCache, cacheName).Replace(searchValue, cacheValue));
                             continue;
                         }
@@ -9682,8 +9681,9 @@ async function cb_RunWasmMethodResult(wasmLanguage, wasmUrl, funcName, args = []
     {
         case 'c': return (await cb_RunWasmMethod_C(wasmUrl, funcName, args)).result;
         case "rust": return (await cb_RunWasmMethod_Rust(wasmUrl, funcName, args)).result;
-        case "csharp": return (await cb_RunWasmMethod_CSharp(wasmUrl, funcName, args)).result;
-        case "csharp-m": return (await cb_RunWasmMethod_CSharpMediator(wasmUrl, funcName, args));
+        case "csharp":
+        case "csharp-m":
+             return (await cb_RunWasmMethod_CSharp(wasmUrl, funcName, args)).result;
         case "go": return (await cb_RunWasmMethod_Go(wasmUrl, funcName, args)).result;
         case "java": return (await cb_RunWasmMethod_Java(wasmUrl, funcName, args)).result;
         case "as": return (await cb_RunWasmMethod_AS(wasmUrl, funcName, args)).result;
@@ -9695,91 +9695,214 @@ async function cb_RunWasmMethodResult(wasmLanguage, wasmUrl, funcName, args = []
 // RUST
 async function cb_RunWasmMethod_Rust(wasmUrl, funcName, args = [])
 {
-    let instance;
-    let memory;
-
-    const imports = {
-        env: {
-            memory: new WebAssembly.Memory({ initial: 256 }),
-            table: new WebAssembly.Table({ initial: 0, element: "anyfunc" }),
-            __wbindgen_throw: (ptr, len) =>
-            {
-                const memView = new Uint8Array(memory.buffer);
-                const msg = new TextDecoder("utf-8").decode(memView.subarray(ptr, ptr + len));
-                throw new Error(msg);
-            }
-        }
-    };
-
-    try
+    if (wasmUrl.EndsWith(".wasm"))
     {
-        const response = await fetch(wasmUrl);
-        const bytes = await response.arrayBuffer();
-        const { instance: inst } = await WebAssembly.instantiate(bytes, imports);
-        instance = inst;
-        memory = instance.exports.memory || imports.env.memory;
-    }
-    catch (er)
-    {
-        throw new Error(`Failed to instantiate WASM module: ${er.message}`, er);
-    }
+        let instance;
+        let memory;
+        let wasmBindgen = false;
 
-    const method = instance.exports[funcName];
-    if (typeof method !== "function")
-        throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(instance.exports).join(", ")}`);
-
-    // Inputs
-    const processedArgs = [];
-    for (const arg of args)
-    {
-        if (typeof arg === "string")
-        {
-            if (!instance.exports.alloc)
-            {
-                if (WebFormsOptions.AddConsoleMessage)
-                    console.warn("alloc not exported: cannot pass strings to WASM directly");
-
-                processedArgs.push(0);
-            }
-            else
-            {
-                const encoder = new TextEncoder();
-                const encoded = encoder.encode(arg + "\0");
-                const ptr = instance.exports.alloc(encoded.length);
-                new Uint8Array(memory.buffer).set(encoded, ptr);
-                processedArgs.push(ptr);
-            }
-        }
-        else
-        {
-            processedArgs.push(arg);
-        }
-    }
-
-    let result = method(...processedArgs);
-
-    // Output Detection
-    if (typeof result === "number" && result > 0 && memory)
-    {
         try
         {
-            const memView = new Uint8Array(memory.buffer);
-            let end = result;
+            const response = await fetch(wasmUrl);
 
-            while (end < memView.length && memView[end] !== 0)
-                end++;
+            if (!response.ok)
+                throw new Error(`Failed to fetch WASM: ${response.status} ${response.statusText}`);
 
-            const text = new TextDecoder("utf-8").decode(memView.subarray(result, end));
-            if (text.trim().length > 0)
-                result = text;
+            const bytes = await response.arrayBuffer();
+            const module = await WebAssembly.compile(bytes);
+
+            const imports = WebAssembly.Module.imports(module);
+            const importObject = {};
+
+            for (const item of imports)
+            {
+                if (!importObject[item.module])
+                    importObject[item.module] = {};
+
+                if (item.name === "__wbindgen_init_externref_table")
+                {
+                    importObject[item.module][item.name] = function()
+                    {
+                        const table = instance.exports.__wbindgen_externrefs;
+                        const offset = table.grow(4);
+
+                        table.set(0, undefined);
+                        table.set(offset + 0, undefined);
+                        table.set(offset + 1, null);
+                        table.set(offset + 2, true);
+                        table.set(offset + 3, false);
+                    };
+                }
+                else
+                    throw new Error(`Unsupported WASM import: ${item.module}.${item.name}`);
+            }
+
+            wasmBindgen = imports.some(x => x.name.startsWith("__wbindgen_")) || WebAssembly.Module.exports(module).some(x => x.name.startsWith("__wbindgen_"));
+
+            const result = await WebAssembly.instantiate(module, importObject);
+
+            instance = result instanceof WebAssembly.Instance ? result : result.instance;
+
+            memory = instance.exports.memory;
+
+            if (!memory)
+                throw new Error("WASM memory export not found.");
+
+            if (wasmBindgen && instance.exports.__wbindgen_start)
+                instance.exports.__wbindgen_start();
         }
-        catch
+        catch (er)
         {
-            /* empty */
+            throw new Error(`Failed to instantiate WASM module: ${er.message}`,{ cause: er });
         }
-    }
 
-    return { result, memory };
+        let method = instance.exports[funcName];
+
+        if (typeof method !== "function")
+        {
+            const snakeName = funcName.replace(/[A-Z]/g, letter => "_" + letter.toLowerCase());
+
+            method = instance.exports[snakeName];
+        }
+
+        if (typeof method !== "function")
+            throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(instance.exports).join(", ")}`);
+
+        if (wasmBindgen)
+        {
+            const processedArgs = [];
+
+            for (const arg of args)
+            {
+                if (typeof arg === "string")
+                {
+                    const encoder = new TextEncoder();
+                    const encoded = encoder.encode(arg);
+
+                    const ptr = instance.exports.__wbindgen_malloc(encoded.length, 1);
+
+                    new Uint8Array(memory.buffer).subarray(ptr, ptr + encoded.length).set(encoded);
+
+                    processedArgs.push(ptr);
+                    processedArgs.push(encoded.length);
+                }
+                else
+                    processedArgs.push(arg);
+            }
+
+            const ret = method(...processedArgs);
+
+            // wasm-bindgen String Return:
+            // [pointer, length]
+            if (ret && typeof ret === "object" && 0 in ret && 1 in ret)
+            {
+                const ptr = ret[0];
+                const len = ret[1];
+
+                const text = new TextDecoder("utf-8").decode(new Uint8Array(memory.buffer).subarray(ptr, ptr + len));
+
+                if (instance.exports.__wbindgen_free)
+                    instance.exports.__wbindgen_free(ptr, len, 1);
+
+                return {result: text, memory};
+            }
+
+            return {result: ret, memory};
+        }
+
+        const processedArgs = [];
+
+        for (const arg of args)
+        {
+            if (typeof arg === "string")
+            {
+                if (!instance.exports.alloc)
+                {
+                    if (WebFormsOptions.AddConsoleMessage)
+                        console.warn("alloc not exported: cannot pass strings to WASM directly");
+
+                    processedArgs.push(0);
+                }
+                else
+                {
+                    const encoder = new TextEncoder();
+                    const encoded = encoder.encode(arg + "\0");
+
+                    const ptr = instance.exports.alloc(encoded.length);
+
+                    new Uint8Array(memory.buffer)
+                        .set(encoded, ptr);
+
+                    processedArgs.push(ptr);
+                }
+            }
+            else
+                processedArgs.push(arg);
+        }
+
+        let result = method(...processedArgs);
+
+        if (typeof result === "number" && result > 0 && memory)
+        {
+            try
+            {
+                const memView = new Uint8Array(memory.buffer);
+                let end = result;
+
+                while (end < memView.length && memView[end] !== 0)
+                    end++;
+
+                const text = new TextDecoder("utf-8").decode(memView.subarray(result, end));
+
+                if (text.trim().length > 0)
+                    result = text;
+            }
+            catch
+            {
+                /* empty */
+            }
+        }
+
+        return {result, memory};
+    }
+    else if (wasmUrl.EndsWith(".js"))
+    {
+        let module;
+
+        try
+        {
+            const absoluteUrl = new URL(wasmUrl, document.baseURI).href;
+
+            module = await import(absoluteUrl);
+        }
+        catch (er)
+        {
+            throw new Error(`Failed to load WASM JavaScript module: ${er.message}`, { cause: er });
+        }
+
+        // wasm-bindgen initialization
+        if (typeof module.default === "function")
+            await module.default();
+
+        let method = module[funcName];
+
+        // Support camelCase names for snake_case Rust exports.
+        if (typeof method !== "function")
+        {
+            const snakeName = funcName.replace(/[A-Z]/g, letter => "_" + letter.toLowerCase());
+
+            method = module[snakeName];
+        }
+
+        if (typeof method !== "function")
+        {
+            throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(module).join(", ")}`);
+        }
+
+        const result = await method(...args);
+
+        return {result};
+    }
 }
 
 // C/C++
@@ -9857,152 +9980,149 @@ async function cb_RunWasmMethod_C(wasmUrl, funcName, args = [])
 // C# (.NET)
 async function cb_RunWasmMethod_CSharp(wasmUrl, funcName, args = [])
 {
-    let instance;
-    let memory;
-
-    const imports = { env: {} };
-
-    try
+    if (wasmUrl.EndsWith(".wasm"))
     {
-        const response = await fetch(wasmUrl);
-        const bytes = await response.arrayBuffer();
-        const { instance: inst } = await WebAssembly.instantiate(bytes, imports);
-        instance = inst;
-        memory = instance.exports.memory;
+        const frameworkUrl = wasmUrl.substring(0, wasmUrl.lastIndexOf('/') + 1);
+
+        const dotnet = await import(frameworkUrl + "dotnet.js");
+
+        const runtime = await dotnet.dotnet.withApplicationArgumentsFromQuery().create();
+
+        const config = runtime.getConfig();
+
+        const exports = await runtime.getAssemblyExports(config.mainAssemblyName);
+
+        const lastDot = funcName.lastIndexOf(".");
+
+        if (lastDot <= 0 || lastDot === funcName.length - 1)
+            throw new Error(`Invalid C# method name: ${funcName}`);
+
+        const typeName = funcName.substring(0, lastDot);
+        const methodName = funcName.substring(lastDot + 1);
+
+        const type = exports[typeName];
+
+        if (!type)
+            throw new Error(`Type ${typeName} not found`);
+
+        const method = type[methodName];
+
+        if (typeof method !== "function")
+            throw new Error(`Function ${funcName} not found`);
+
+        const result = await method(...args);
+        return { result };
     }
-    catch (er)
+    else if (wasmUrl.EndsWith(".js"))
     {
-        throw new Error(`C# WASM init failed: ${er.message}`, er);
+        const dotnet = await import(wasmUrl);
+
+        const runtime = await dotnet.dotnet.withApplicationArgumentsFromQuery().create();
+
+        const config = runtime.getConfig();
+
+        const exports = await runtime.getAssemblyExports(config.mainAssemblyName);
+
+        const lastDot = funcName.lastIndexOf('.');
+
+        if (lastDot <= 0 || lastDot === funcName.length - 1)
+            throw new Error(`Invalid C# method name: ${funcName}`);
+
+        const typeName = funcName.substring(0, lastDot);
+        const methodName = funcName.substring(lastDot + 1);
+
+        const type = exports[typeName];
+
+        if (!type)
+            throw new Error(`Type ${typeName} not found`);
+
+        const method = type[methodName];
+
+        if (typeof method !== "function")
+            throw new Error(`Function ${funcName} not found`);
+
+        const result = await method(...args);
+        return { result };
     }
-
-    const method = instance.exports[funcName];
-    if (typeof method !== "function")
-        throw new Error(`Function ${funcName} not found in C# WASM exports`);
-
-    // Inputs
-    const processedArgs = [];
-    for (const arg of args)
-    {
-        if (typeof arg === "string")
-        {
-            const encoder = new TextEncoder();
-            const encoded = encoder.encode(arg);
-            const ptr = instance.exports.malloc(encoded.length);
-            new Uint8Array(memory.buffer).set(encoded, ptr);
-            processedArgs.push(ptr, encoded.length);
-        }
-        else
-            processedArgs.push(arg);
-    }
-
-    let result = method(...processedArgs);
-
-    // Output Detection
-    if (typeof result === "number" && result > 0)
-    {
-        const memView = new Uint8Array(memory.buffer);
-        let end = result;
-
-        while (end < memView.length && memView[end] !== 0)
-            end++;
-
-        const text = new TextDecoder("utf-8").decode(memView.subarray(result, end));
-        if (text.trim().length > 0)
-            result = text;
-    }
-
-    return { result, memory };
-}
-
-async function cb_RunWasmMethod_CSharpMediator(mediatorUrl, funcName, args = [])
-{
-    const dotnet = await import(mediatorUrl);
-
-    const runtime = await dotnet.dotnet.withApplicationArgumentsFromQuery().create();
-
-    const config = runtime.getConfig();
-
-    const exports = await runtime.getAssemblyExports(config.mainAssemblyName);
-
-    const lastDot = funcName.lastIndexOf(".");
-
-    if (lastDot <= 0 || lastDot === funcName.length - 1)
-        throw new Error(`Invalid C# method name: ${funcName}`);
-
-    const typeName = funcName.substring(0, lastDot);
-    const methodName = funcName.substring(lastDot + 1);
-
-    const type = exports[typeName];
-
-    if (!type)
-        throw new Error(`Type ${typeName} not found`);
-
-    const method = type[methodName];
-
-    if (typeof method !== "function")
-        throw new Error(`Function ${funcName} not found`);
-
-    return method(...args);
 }
 
 // GO
 async function cb_RunWasmMethod_Go(wasmUrl, funcName, args = [])
 {
-    let instance;
-    let memory;
-
-    const imports = { env: {} };
-
     try
     {
-        const response = await fetch(wasmUrl);
+        const slash = wasmUrl.lastIndexOf("/");
+        const baseUrl = slash >= 0 ? wasmUrl.substring(0, slash + 1) : "";
+
+        let wasmExecUrl = baseUrl + "wasm_exec.js";
+        let wasmFileUrl = wasmUrl;
+
+        // If wasm_exec.js was provided, find the WASM file in the same directory.
+        if (wasmUrl.toLowerCase().endsWith("wasm_exec.js"))
+            wasmFileUrl = baseUrl + "webforms-go.wasm";
+
+        // Load Go WASM Runtime
+        if (typeof Go === "undefined")
+        {
+            await new Promise((resolve, reject) =>
+            {
+                const script = document.createElement("script");
+
+                script.src = wasmExecUrl;
+
+                script.onload = () =>
+                {
+                    if (typeof Go === "undefined")
+                    {
+                        reject(new Error("wasm_exec.js loaded, but Go runtime was not found."));
+                        return;
+                    }
+
+                    resolve();
+                };
+
+                script.onerror = () =>
+                {
+                    reject(new Error("Failed to load Go WASM runtime: " + wasmExecUrl));
+                };
+
+                document.head.appendChild(script);
+            });
+        }
+
+        const go = new Go();
+
+        const response = await fetch(wasmFileUrl);
+
+        if (!response.ok)
+            throw new Error(
+                `Failed to fetch Go WASM: ${response.status} ${response.statusText}`
+            );
+
         const bytes = await response.arrayBuffer();
-        const { instance: inst } = await WebAssembly.instantiate(bytes, imports);
-        instance = inst;
-        memory = instance.exports.memory;
+
+        const result = await WebAssembly.instantiate(
+            bytes,
+            go.importObject
+        );
+
+        go.run(result.instance);
+
+        const method = globalThis[funcName];
+
+        if (typeof method !== "function")
+            throw new Error(`Function ${funcName} not found in Go WASM.`);
+
+        const output = method(...args);
+
+        return {
+            result: output
+        };
     }
     catch (er)
     {
-        throw new Error(`Go WASM init failed: ${er.message}`, er);
+        throw new Error(`Go WASM execution failed: ${er.message}`, er);
     }
-
-    const method = instance.exports[funcName];
-    if (typeof method !== "function")
-        throw new Error(`Function ${funcName} not found in Go WASM exports`);
-
-    // Inputs
-    const processedArgs = [];
-    for (const arg of args)
-    {
-        if (typeof arg === "string")
-        {
-            const encoder = new TextEncoder();
-            const encoded = encoder.encode(arg);
-            const ptr = instance.exports.malloc(encoded.length);
-            new Uint8Array(memory.buffer).set(encoded, ptr);
-            processedArgs.push(ptr, encoded.length);
-        }
-        else
-            processedArgs.push(arg);
-    }
-
-    let result = method(...processedArgs);
-
-    // Output Detection
-    if (typeof result === "number" && result > 0)
-    {
-        const memView = new Uint8Array(memory.buffer);
-        let end = result;
-
-        while (end < memView.length && memView[end] !== 0)
-            end++;
-
-        const text = new TextDecoder("utf-8").decode(memView.subarray(result, end));
-        if (text.trim().length > 0)
-            result = text;
-    }
-
-    return { result, memory };
 }
 
 // JAVA
@@ -10066,68 +10186,217 @@ async function cb_RunWasmMethod_Java(wasmUrl, funcName, args = [])
 }
 
 // AssemblyScript
-async function cb_RunWasmMethod_AS(wasmUrl, funcName, args = [])
+async function cb_RunWasmMethod_AS(wasmUrl, funcName, args = [], resultType = "auto")
 {
-    const response = await fetch(wasmUrl);
-    const bytes = await response.arrayBuffer();
-
-    const memory = new WebAssembly.Memory({ initial: 256 });
-    const imports = {
-        env: {
-            memory,
-            table: new WebAssembly.Table({ initial: 0, element: "anyfunc" }),
-        }
-    };
-
-    const { instance } = await WebAssembly.instantiate(bytes, imports);
-
-    const method = instance.exports[funcName];
-    if (typeof method !== "function")
-        throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(instance.exports).join(", ")}`);
-
-    const processedArgs = [];
-    const stringPointers = [];
-
-    // Inputs
-    for (const arg of args)
+    if (wasmUrl.EndsWith(".wasm"))
     {
-        if (typeof arg === "string")
+        const response = await fetch(wasmUrl);
+        const bytes = await response.arrayBuffer();
+
+        const module = await WebAssembly.compile(bytes);
+
+        let exports;
+
+        const imports = {
+            env: {
+                abort(message, fileName, lineNumber, columnNumber)
+                {
+                    message = __liftString(message >>> 0);
+                    fileName = __liftString(fileName >>> 0);
+
+                    throw Error(`${message} in ${fileName}:${lineNumber >>> 0}:${columnNumber >>> 0}`);
+                }
+            }
+        };
+
+        const instance = await WebAssembly.instantiate(module, imports);
+
+        exports = instance.exports;
+
+        const memory = exports.memory;
+
+        if (!memory)
+            throw new Error("WebAssembly memory export was not found.");
+
+        let method = exports[funcName];
+
+        // Case-insensitive export lookup
+        if (typeof method !== "function")
         {
-            if (!instance.exports.__new) throw new Error("__new not exported for string allocation");
-            const encoder = new TextEncoder();
-            const encoded = encoder.encode(arg);
-            const ptr = instance.exports.__new(encoded.length, 0); // 0: String Type In AssemblyScript Runtime
-            new Uint8Array(memory.buffer).set(encoded, ptr);
-            processedArgs.push(ptr);
-            processedArgs.push(encoded.length);
-            stringPointers.push(ptr);
+            const exportName = Object.keys(exports)
+                .find(name => name.toLowerCase() === String(funcName).toLowerCase());
+
+            if (exportName)
+                method = exports[exportName];
         }
-        else
-            processedArgs.push(arg);
-    }
 
-    let result = method(...processedArgs);
+        if (typeof method !== "function")
+            throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(exports).join(", ")}`);
 
-    // Output Detection
-    if (typeof result === "number" && result > 0)
-    {
+        const refCounts = new Map();
+
+        function retain(pointer)
+        {
+            if (pointer)
+            {
+                const refCount = refCounts.get(pointer);
+
+                if (refCount)
+                    refCounts.set(pointer, refCount + 1);
+                else
+                    refCounts.set(pointer, 1);
+
+                if (typeof exports.__pin === "function")
+                    exports.__pin(pointer);
+            }
+
+            return pointer;
+        }
+
+        function release(pointer)
+        {
+            if (!pointer)
+                return;
+
+            const refCount = refCounts.get(pointer);
+
+            if (refCount === 1)
+            {
+                if (typeof exports.__unpin === "function")
+                    exports.__unpin(pointer);
+
+                refCounts.delete(pointer);
+            }
+            else if (refCount)
+                refCounts.set(pointer, refCount - 1);
+        }
+
+        function lowerString(value)
+        {
+            if (value == null)
+                return 0;
+
+            const length = value.length;
+
+            if (typeof exports.__new !== "function")
+                throw new Error("__new export was not found.");
+
+            const pointer = exports.__new(length << 1, 2) >>> 0;
+
+            const memoryU16 = new Uint16Array(memory.buffer);
+
+            for (let i = 0; i < length; ++i)
+                memoryU16[(pointer >>> 1) + i] = value.charCodeAt(i);
+
+            return pointer;
+        }
+
+        function liftString(pointer)
+        {
+            pointer = pointer >>> 0;
+
+            if (!pointer)
+                return null;
+
+            const memoryU32 = new Uint32Array(memory.buffer);
+            const memoryU16 = new Uint16Array(memory.buffer);
+
+            const end = pointer + memoryU32[(pointer - 4) >>> 2] >>> 1;
+
+            let start = pointer >>> 1;
+            let string = "";
+
+            while (end - start > 1024)
+                string += String.fromCharCode(...memoryU16.subarray(start, start += 1024));
+
+            return string + String.fromCharCode(...memoryU16.subarray(start, end));
+        }
+
+        const processedArgs = [];
+        const stringPointers = [];
+
+        for (const arg of args)
+        {
+            if (typeof arg === "string")
+            {
+                const pointer = lowerString(arg);
+
+                retain(pointer);
+
+                processedArgs.push(pointer);
+                stringPointers.push(pointer);
+            }
+            else
+                processedArgs.push(arg);
+        }
+
+        let result;
+
         try
         {
-            const memView = new Uint8Array(memory.buffer);
-            let end = result;
-
-            while (end < memView.length && memView[end] !== 0)
-                end++;
-
-            result = new TextDecoder("utf-8").decode(memView.subarray(result, end));
+            result = method(...processedArgs);
         }
-        catch
+        finally
         {
-            /* empty */
+            for (const pointer of stringPointers)
+                release(pointer);
         }
-    }
 
-    return { result, memory };
+        if (resultType === "string")
+            result = liftString(result);
+
+        else if (resultType === "auto")
+        {
+            if (typeof result === "number" && result > 0 && result < memory.buffer.byteLength && (result & 1) === 0)
+            {
+                try
+                {
+                    const memoryU32 = new Uint32Array(memory.buffer);
+                    const length = memoryU32[(result - 4) >>> 2];
+
+                    if (length > 0 && length <= memory.buffer.byteLength && result + length <= memory.buffer.byteLength * 2)
+                        result = liftString(result);
+                }
+                catch {}
+            }
+        }
+
+        return {result, exports, memory};
+    }
+    else if (wasmUrl.EndsWith(".js"))
+    {
+        const module = await import(wasmUrl);
+        let exports;
+
+        if (typeof module.instantiate === "function")
+        {
+            const instance = await module.instantiate();
+
+            exports = instance.exports || instance;
+        }
+        else if (module.exports)
+            exports = module.exports;
+        else
+            exports = module;
+
+        let method = exports[funcName];
+
+        // Case-insensitive export lookup
+        if (typeof method !== "function")
+        {
+            const exportName = Object.keys(exports).find(name => name.toLowerCase() === String(funcName).toLowerCase());
+
+            if (exportName)
+                method = exports[exportName];
+        }
+
+        if (typeof method !== "function")
+            throw new Error(`Function "${funcName}" not found. Available: ${Object.keys(exports).join(", ")}`);
+
+        const result = await method(...args);
+
+        return {result, exports};
+    }
 }
 
 /* End Wasm */
